@@ -16,7 +16,7 @@ from torchlibrosa import LogmelFilterBank
 
 from model import RFCXModel, kaggle_metric, criterion
 from data import get_loader
-from utils import make_reproducible, mkdir, CFG, getfminfmax, sigmoid
+from utils import make_reproducible, mkdir, CFG, getfminfmax
 from cam import FeatureHook, get_cam, blend_cam
 
 warnings.filterwarnings('ignore')
@@ -79,15 +79,6 @@ def main_worker(rank, world_size, cfg):
     # mixed precision
     amp_scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)
 
-    # teacher
-    if cfg.teacher_path is not None:
-        checkpoint = torch.load(cfg.teacher_path, map_location='cpu')
-        teacher_model = RFCXModel(CFG(checkpoint['cfg'])).to(rank).eval()
-        _ = teacher_model.load_state_dict(checkpoint['model'], strict=False)
-        if verbose_cond:
-            print(_)
-            print(f'Loaded Teacher Model from {cfg.teacher_path}')
-
     # pretrained
     if cfg.pretrained_path is not None:
         checkpoint = torch.load(cfg.pretrained_path, map_location='cpu')
@@ -146,12 +137,6 @@ def main_worker(rank, world_size, cfg):
                 data['audio'] = data['audio'] * 0.5 + data['audio'][index] * 0.5
                 data['labels'] = torch.maximum(data['labels'], data['labels'][index])
                 data['masks'] = torch.maximum(data['masks'], data['masks'][index])
-
-            if cfg.teacher_path is not None:
-                with torch.no_grad():
-                    teacher_logits = teacher_model(data['audio'])
-                    data['labels'] = torch.where(data['masks'] == 1, data['labels'], torch.sigmoid(teacher_logits))
-
             with torch.cuda.amp.autocast(enabled=cfg.amp):
                 logits = model(data['audio'])
                 if cfg.species_id is None:
@@ -160,7 +145,6 @@ def main_worker(rank, world_size, cfg):
                 else:
                     loss = criterion(logits, data['labels'][:, [cfg.species_id]], data['masks'][:, [cfg.species_id]],
                                      focal=cfg.focal, pos_weight=cfg.pos_weight, lsoft=cfg.lsoft, lsep=cfg.lsep)
-
             amp_scaler.scale(loss).backward()
             amp_scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
@@ -216,11 +200,7 @@ def main_worker(rank, world_size, cfg):
                 for data in iterator:
                     for k in data.keys():
                         data[k] = data[k].to(rank)
-
-                    if cfg.teacher_path is not None:
-                        teacher_logits = teacher_model(data['audio'])
-                        data['labels'] = torch.where(data['masks'] == 1, data['labels'], torch.sigmoid(teacher_logits))
-
+                    # predict for every chunk and get max
                     logits = model(data['audio'])
                     # gather all
                     g_cls_logits = [torch.zeros(logits.shape).to(rank) for _ in range(world_size)]
@@ -248,6 +228,7 @@ def main_worker(rank, world_size, cfg):
                 val_metric = kaggle_metric(val_preds, val_targets)
             else:
                 val_metric = roc_auc_score(val_targets[:, cfg.species_id], val_preds[:, 0])
+
             str_val_metric = np.round(val_metric, 6)
             str_val_loss = np.round(val_loss, 6)
         else:
@@ -280,13 +261,7 @@ def main_worker(rank, world_size, cfg):
             torch.save(tmp_info, f'{cfg.logdir}/last.pth')
         if verbose_cond:
             print(f'(val) LOSS: {str_val_loss} | METRIC: {str_val_metric} || Runtime: {int(time() - t00)}')
-            lst = []
-            for i in range(24):
-                tmp = roc_auc_score(np.round(val_targets[:, i]), val_preds[:, i])
-                lst.append(np.round(tmp, 4))
-                tmp = np.round(sigmoid(val_preds).mean(axis=0), 4).tolist()
-            print(np.round(np.mean(tmp), 4), tmp)
-            print(np.round(np.mean(lst), 4), lst)
+
     if rank == 0:
         joblib.dump(cams, f'{cfg.logdir}/cams.jl')
 
@@ -359,8 +334,6 @@ if __name__ == '__main__':
     parser.add_argument('--lsoft', type=float, default=0.)
     parser.add_argument('--lsep', type=int, default=0)
     parser.add_argument('--random_sample_prob', type=float, default=0)
-    parser.add_argument('--teacher_path', type=str)
-    parser.add_argument('--fminfmax_offset', type=float, default=100)
 
     args = parser.parse_args()
     args.amp = bool(args.amp)
@@ -371,7 +344,7 @@ if __name__ == '__main__':
     if cfg.species_id is None:
         cfg.fmin, cfg.fmax = 25, 15000
     else:
-        cfg.fmin, cfg.fmax = getfminfmax(cfg.species_id, cfg.fminfmax_offset)
+        cfg.fmin, cfg.fmax = getfminfmax(cfg.species_id)
 
     world_size = torch.cuda.device_count()
     torch.multiprocessing.spawn(main_worker, nprocs=world_size, args=(world_size, cfg))

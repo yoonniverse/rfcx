@@ -2,7 +2,6 @@ import torch
 import os
 import random
 import numpy as np
-import pandas as pd
 from pathlib import Path
 import psutil
 import time
@@ -80,10 +79,52 @@ def normalize(x):
     return (x-min)/(max-min)
 
 
-def transform(x, offset):
-    return frommelscale(tomelscale(x)+offset).astype(int)
-
-
-def getfminfmax(i, offset=100):
-    df = pd.read_feather('fminfmax_by_sid.ft')
-    return max(0, transform(df.loc[i, 'f_min'], -offset)), min(24000, transform(df.loc[i, 'f_max'], offset))
+def getfminfmax(i):
+    if i == 0:
+        return 5345, 9080
+    elif i == 1:
+        return 3457, 6211
+    elif i == 2:
+        return 369, 3343
+    elif i == 3:
+        return 884, 3138
+    elif i == 4:
+        return 2085, 4675
+    elif i == 5:
+        return 4315, 12358
+    elif i == 6:
+        return 455, 4880
+    elif i == 7:
+        return 4230, 12563
+    elif i == 8:
+        return 3372, 6109
+    elif i == 9:
+        return 712, 6314
+    elif i == 10:
+        return 807, 11924
+    elif i == 11:
+        return 1595, 6277
+    elif i == 12:
+        return 455, 3650
+    elif i == 13:
+        return 26, 1601
+    elif i == 14:
+        return 2256, 7133
+    elif i == 15:
+        return 26, 1294
+    elif i == 16:
+        return 2771, 5084
+    elif i == 17:
+        return 1141, 8158
+    elif i == 18:
+        return 2857, 5597
+    elif i == 19:
+        return 197, 3138
+    elif i == 20:
+        return 1141, 6724
+    elif i == 21:
+        return 2943, 4572
+    elif i == 22:
+        return 9720, 15022
+    else:
+        return 5852, 12771
