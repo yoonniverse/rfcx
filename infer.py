@@ -69,10 +69,10 @@ def infer(cfg):
             for model, fname in zip(models, fnames):
                 x = data['audio'].to(device)
                 if cfg.full_clip:
-                    pred = model(x).cpu().numpy()
+                    pred = torch.sigmoid(model(x)).cpu().numpy()
                 else:
                     b, n, c = x.shape
-                    per_window_pred = model(x.view(b*n, c)).view(b, n, -1)
+                    per_window_pred = torch.sigmoid(model(x.view(b*n, c)).view(b, n, -1))
                     pred = per_window_pred.max(dim=1)[0].cpu().numpy()
                 if cfg.model_per_species:
                     sid = int(fname[1:])
@@ -80,7 +80,7 @@ def infer(cfg):
                 else:
                     batch_preds += pred/len(models)
             preds.append(batch_preds)
-    preds = sigmoid(np.concatenate(preds, axis=0))
+    preds = np.concatenate(preds, axis=0)
     return uids, preds
 
 

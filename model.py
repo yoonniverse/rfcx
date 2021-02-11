@@ -93,13 +93,15 @@ def criterion(pred, true, masks, focal=0., pos_weight=1., lsoft=0., lsep=0):
         with torch.no_grad():
             tmp_true = (1 - lsoft) * true + lsoft * torch.sigmoid(pred)
         true = torch.where(masks == 0, tmp_true, true)
+    loss = nn.BCEWithLogitsLoss(reduction='none')(pred, true)
+    if pos_weight != 1:
+        loss = torch.where(true >= 0.5, pos_weight * loss, loss)
     if focal > 0:
-        loss = nn.BCEWithLogitsLoss(reduction='none', pos_weight=torch.tensor(pos_weight))(pred, true)
         probas = torch.sigmoid(pred)
         loss = torch.where(true >= 0.5, (1. - probas) ** focal * loss, probas ** focal * loss)
-        return loss.mean()
-    else:
-        return nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))(pred, true)
+    if lsoft == 1:
+        loss = (loss*masks).sum(dim=-1)/masks.sum(dim=-1)
+    return loss.mean()
 
 
 def lsep_loss(input, target, average=True):
@@ -148,7 +150,7 @@ class RFCXModel(nn.Module):
 
         self.logmel_extractors = []
         for i in range(24):
-            fmin, fmax = getfminfmax(i)
+            fmin, fmax = getfminfmax(i, cfg.fminfmax_offset)
             self.logmel_extractors.append(
                 LogmelFilterBank(
                     sr=self.cfg.sr,
