@@ -152,18 +152,16 @@ def main_worker(rank, world_size, cfg):
 
             if cfg.teacher_paths is not None:
                 with torch.no_grad():
-                    teacher_probs = [torch.sigmoid(teacher_model(data['audio'])) for teacher_model in teacher_models]
-                    teacher_probs = torch.stack(teacher_probs, dim=0).mean(dim=0)
+                    teacher_probs = [torch.sigmoid(teacher_model(data['audio']))+cfg.teacher_adder for teacher_model in teacher_models]
+                    teacher_probs = torch.stack(teacher_probs, dim=0).mean(dim=0).clamp(0, 1)
+                    if cfg.teacher_pred_thresh:
+                        teacher_probs = (teacher_probs > cfg.teacher_pred_thresh).float()
                     data['labels'] = torch.where(data['masks'] == 1, data['labels'], teacher_probs)
 
             with torch.cuda.amp.autocast(enabled=cfg.amp):
                 logits = model(data['audio'])
-                if cfg.species_id is None:
-                    loss = criterion(logits, data['labels'], data['masks'], focal=cfg.focal,
-                                     pos_weight=cfg.pos_weight, lsoft=cfg.lsoft, lsep=cfg.lsep)
-                else:
-                    loss = criterion(logits, data['labels'][:, [cfg.species_id]], data['masks'][:, [cfg.species_id]],
-                                     focal=cfg.focal, pos_weight=cfg.pos_weight, lsoft=cfg.lsoft, lsep=cfg.lsep)
+                loss = criterion(logits, data['labels'], data['masks'], focal=cfg.focal, pos_weight=cfg.pos_weight,
+                                 lsoft=cfg.lsoft, lsep_weight=cfg.lsep_weight, default_label=cfg.default_label)
 
             amp_scaler.scale(loss).backward()
             amp_scaler.unscale_(optimizer)
@@ -185,28 +183,25 @@ def main_worker(rank, world_size, cfg):
             print(f'(trn) LOSS: {str_train_loss}', end=' || ')
 
         # visualize cam
-        with torch.no_grad():
-            dataset = val_loader.dataset
-            for sid in range(24):
-                rid_lst = rid_by_sid[sid]
-                rid_lst = [x for x in rid_lst if x in dataset.df.index][:3]
-                for rid in rid_lst:
-                    idx = np.argwhere(dataset.df.index == rid).flatten()[0]
-                    cur = dataset[idx]
-                    feature_hook = FeatureHook(model.module.encoder.act2)
-                    model = model.eval()
-                    audio = cur['audio'].unsqueeze(0).to(rank)
-                    if cfg.species_id is None:
-                        pred = model(audio)[0, sid]
-                    else:
-                        pred = model(audio)[0, 0]
-                    feature_hook.remove()
-                    fc_weights = np.squeeze(list(model.module.heads[sid].parameters())[2].cpu().numpy())
-                    feature_map = feature_hook.features
-                    b, c, h, w = feature_map.shape
-                    cam = get_cam(feature_map.reshape(24, 1, c, h, w)[sid], fc_weights)
-                    spectrogram = model.module.logmel_extractors[sid](model.module.spectrogram_extractor(audio))[0, 0].cpu().numpy()
-                    cams[sid][rid].append((pred.item(), blend_cam(spectrogram, cam, (1000, 100))))
+        # with torch.no_grad():
+        #     dataset = val_loader.dataset
+        #     for sid in range(24):
+        #         rid_lst = rid_by_sid[sid]
+        #         rid_lst = [x for x in rid_lst if x in dataset.df.index][:3]
+        #         for rid in rid_lst:
+        #             idx = np.argwhere(dataset.df.index == rid).flatten()[0]
+        #             cur = dataset[idx]
+        #             feature_hook = FeatureHook(model.module.encoder.act2)
+        #             model = model.eval()
+        #             audio = cur['audio'].unsqueeze(0).to(rank)
+        #             pred = model(audio)[0, sid]
+        #             feature_hook.remove()
+        #             fc_weights = np.squeeze(list(model.module.heads[sid].parameters())[2].cpu().numpy())
+        #             feature_map = feature_hook.features
+        #             b, c, h, w = feature_map.shape
+        #             cam = get_cam(feature_map.reshape(24, 1, c, h, w)[sid], fc_weights)
+        #             spectrogram = model.module.logmel_extractors[sid](model.module.spectrogram_extractor(audio))[0, 0].cpu().numpy()
+        #             cams[sid][rid].append((pred.item(), blend_cam(spectrogram, cam, (1000, 100))))
 
         # validate
         if (epoch % cfg.val_freq == 0) and (not cfg.full):
@@ -221,10 +216,10 @@ def main_worker(rank, world_size, cfg):
                     for k in data.keys():
                         data[k] = data[k].to(rank)
 
-                    if cfg.teacher_paths is not None:
-                            teacher_probs = [torch.sigmoid(teacher_model(data['audio'])) for teacher_model in teacher_models]
-                            teacher_probs = torch.stack(teacher_probs, dim=0).mean(dim=0)
-                            data['labels'] = torch.where(data['masks'] == 1, data['labels'], teacher_probs)
+                    # if cfg.teacher_paths is not None:
+                    #     teacher_probs = [torch.sigmoid(teacher_model(data['audio'])) for teacher_model in teacher_models]
+                    #     teacher_probs = torch.stack(teacher_probs, dim=0).mean(dim=0)
+                    #     data['labels'] = torch.where(data['masks'] == 1, data['labels'], teacher_probs)
 
                     logits = model(data['audio'])
                     # gather all
@@ -241,18 +236,14 @@ def main_worker(rank, world_size, cfg):
                     val_preds += g_cls_logits.cpu().tolist()
                     val_targets += g_labels.cpu().tolist()
                     val_masks += g_masks.cpu().tolist()
-                    if cfg.species_id is None:
-                        loss = criterion(g_cls_logits, g_labels, g_masks, lsep=cfg.lsep)
-                    else:
-                        loss = criterion(g_cls_logits, g_labels[:, [cfg.species_id]], g_masks[:, [cfg.species_id]], lsep=cfg.lsep)
+                    loss = criterion(g_cls_logits, g_labels, g_masks, lsep_weight=cfg.lsep_weight, default_label=cfg.default_label)
                     val_loss += loss.item() * len(data['audio']) * world_size / len(val_loader.dataset)
 
             # compute validation metric
             val_preds, val_targets, val_masks = np.array(val_preds), np.array(val_targets), np.array(val_masks)
-            if cfg.species_id is None:
-                val_metric = kaggle_metric(val_preds, val_targets)
-            else:
-                val_metric = roc_auc_score(val_targets[:, cfg.species_id], val_preds[:, 0])
+            rel_index = np.argwhere(val_masks)
+            tmp = tuple(rel_index.T)
+            val_metric = kaggle_metric(np.expand_dims(val_preds[tmp], 0), np.expand_dims(val_targets[tmp], 0))
             str_val_metric = np.round(val_metric, 6)
             str_val_loss = np.round(val_loss, 6)
         else:
@@ -292,8 +283,8 @@ def main_worker(rank, world_size, cfg):
                 tmp = np.round(sigmoid(val_preds).mean(axis=0), 4).tolist()
             print(np.round(np.mean(tmp), 4), tmp)
             print(np.round(np.mean(lst), 4), lst)
-    if rank == 0:
-        joblib.dump(cams, f'{cfg.logdir}/cams.jl')
+    # if rank == 0:
+    #     joblib.dump(cams, f'{cfg.logdir}/cams.jl')
 
     if verbose_cond:
         runtime = int(time() - t0)
@@ -358,25 +349,24 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=int, default=0)
     parser.add_argument('--use_fp', type=int, default=0)
     parser.add_argument('--verbose', type=int, default=1)
-    parser.add_argument('--species_id', type=int)
     parser.add_argument('--uncertain_weight', type=float, default=1.)
     parser.add_argument('--full', type=float, default=0.)
     parser.add_argument('--lsoft', type=float, default=0.)
-    parser.add_argument('--lsep', type=int, default=0)
+    parser.add_argument('--lsep_weight', type=float, default=0)
     parser.add_argument('--random_sample_prob', type=float, default=0)
     parser.add_argument('--teacher_paths', type=str)
     parser.add_argument('--fminfmax_offset', type=float, default=100)
+    parser.add_argument('--pseudo', type=int, default=0)
+    parser.add_argument('--teacher_adder', type=float, default=0)
+    parser.add_argument('--multicrop', type=int, default=1)
+    parser.add_argument('--teacher_pred_thresh', type=float)
+    parser.add_argument('--freq_bn', type=int, default=0)
 
     args = parser.parse_args()
     args.amp = bool(args.amp)
     cfg = CFG(vars(args))
     os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu_numbers
     make_reproducible(cfg.seed)
-
-    if cfg.species_id is None:
-        cfg.fmin, cfg.fmax = 25, 15000
-    else:
-        cfg.fmin, cfg.fmax = getfminfmax(cfg.species_id, cfg.fminfmax_offset)
 
     world_size = torch.cuda.device_count()
     torch.multiprocessing.spawn(main_worker, nprocs=world_size, args=(world_size, cfg))

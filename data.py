@@ -29,16 +29,23 @@ class RFCXDataset(Dataset):
                 folds = joblib.load('folds.jl')
                 uids = folds[cfg.fold][0] if mode == 'train' else folds[cfg.fold][1]
                 self.df = self.df.loc[self.df.index.unique().intersection(uids)]
+            if cfg.pseudo:
+                self.pseudo_uids = sorted(os.listdir(os.path.join(cfg.data_dir, 'test')))
+        if mode == 'train':
+            self.uids = self.df.index
+        else:
+            self.uids = self.df.index.unique()
             # self.df = self.df[self.df['species_id']==cfg.species_id]
         self.mode = mode
 
     def __len__(self):
-        return len(self.df)
+        return len(self.uids)
 
     def __getitem__(self, idx):
-        uid = self.df.index[idx]
+        uid = self.uids[idx]
         base_path = os.path.join(self.cfg.data_dir, 'test' if self.mode == 'test' else 'train')
         path = os.path.join(base_path, str(uid)+'.flac')
+        is_pseudo = False
         out = {}
         if self.mode in ['train', 'valid']:
             if self.mode == 'train':
@@ -47,16 +54,29 @@ class RFCXDataset(Dataset):
             else:
                 length = 60 * self.cfg.sr
                 win_seconds = 60
-            out['labels'] = np.ones(24, dtype=np.float32) * self.cfg.default_label
+            out['labels'] = np.zeros(24, dtype=np.float32)
             out['masks'] = np.zeros(24, dtype=np.float32)
             if (self.mode == 'train') and (np.random.rand() < self.cfg.random_sample_prob):
-                uid = np.random.choice(self.df.index)
-                cur_df = self.df.loc[[uid]]
                 start = np.random.randint(0, (60 - win_seconds) * self.cfg.sr)
                 cur_df_len_thresh = 0
+                if self.cfg.pseudo:
+                    prob_thresh = 0.9
+                else:
+                    prob_thresh = 1.
+                if np.random.rand() < prob_thresh:
+                    uid = np.random.choice(self.df.index.unique())
+                    cur_df = self.df.loc[[uid]]
+                    path = os.path.join(base_path, str(uid) + '.flac')
+                else:
+                    uid = np.random.choice(self.pseudo_uids)
+                    path = os.path.join(os.path.join(self.cfg.data_dir, 'test'), str(uid))
+                    is_pseudo = True
             else:
                 cur_df = self.df.loc[[uid]]
-                row = self.df.iloc[idx]
+                if self.mode == 'valid':
+                    row = cur_df.iloc[0]
+                else:
+                    row = self.df.iloc[idx]
                 # crop
                 k, t0, t1, is_tp = row[['species_id', 't_min', 't_max', 'is_tp']].values
                 min_overlap = min(t1-t0, win_seconds*self.cfg.min_overlap_ratio)
@@ -66,21 +86,22 @@ class RFCXDataset(Dataset):
                         int((t1-min_overlap)*self.cfg.sr)
                     )
                 else:
-                    start = int(max(0, ((t0+t1-win_seconds)/2) * self.cfg.sr))
+                    start = 0
                 out['labels'][k] = 1 if is_tp else 0
                 out['masks'][k] = 1
                 cur_df_len_thresh = 1
 
             # assign other possible labels
-            if len(cur_df) > cur_df_len_thresh:
-                for i, row in cur_df.iterrows():
-                    if out['masks'][row['species_id']] == 1:
-                        continue
-                    min_overlap = min(row['t_max'] - row['t_min'], win_seconds*self.cfg.min_overlap_ratio)
-                    if min(row['t_max'], start/self.cfg.sr + win_seconds) - max(row['t_min'], start/self.cfg.sr) > min_overlap-0.01:
-                        k = row['species_id']
-                        out['labels'][k] = 1 if row['is_tp'] else 0
-                        out['masks'][k] = 1
+            if not is_pseudo:
+                if len(cur_df) > cur_df_len_thresh:
+                    for i, row in cur_df.iterrows():
+                        if out['masks'][row['species_id']] == 1:
+                            continue
+                        min_overlap = min(row['t_max'] - row['t_min'], win_seconds*self.cfg.min_overlap_ratio)
+                        if min(row['t_max'], start/self.cfg.sr + win_seconds) - max(row['t_min'], start/self.cfg.sr) > min_overlap-0.01:
+                            k = row['species_id']
+                            out['labels'][k] = 1 if row['is_tp'] else 0
+                            out['masks'][k] = 1
 
             y, sr = soundfile.read(path, start=start, stop=min(start+length, self.cfg.sr*60))
             assert sr == self.cfg.sr

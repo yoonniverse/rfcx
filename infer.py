@@ -10,6 +10,7 @@ from model import RFCXModel, kaggle_metric
 from data import get_loader
 from train import CFG
 from utils import sigmoid
+from scipy.stats import rankdata
 
 
 def load_model(path, device, cfg):
@@ -59,29 +60,46 @@ def infer(cfg):
         uids = folds[cfg.fold][1]
         paths = [os.path.join(cfg.data_dir, x+'.flac') for x in uids]
     print(f'# uids: {len(paths)}')
-    loader = get_loader(cfg, mode='test', distributed=False)
+    loader = get_loader(cfg, mode='test' if cfg.fold is None else 'valid', distributed=False)
+
+    if cfg.weights is None:
+        weights = np.ones(len(models))
+    else:
+        weights = np.array(cfg.weights.split('-'), dtype=np.float32)
+    weights = weights/weights.sum()
+    print('Ensemble weights:', weights)
 
     # infer
     preds = []
+    trues = []
+    masks = []
     with torch.no_grad():
         for data in tqdm(loader):
+            if cfg.fold is not None:
+                trues.append(data['labels'].numpy())
+                masks.append(data['masks'].numpy())
             batch_preds = np.zeros((len(data['audio']), 24))
-            for model, fname in zip(models, fnames):
+            for model, weight, fname in zip(models, weights, fnames):
                 x = data['audio'].to(device)
                 if cfg.full_clip:
-                    pred = torch.sigmoid(model(x)).cpu().numpy()
+                    pred = model(x).cpu().numpy()
                 else:
                     b, n, c = x.shape
-                    per_window_pred = torch.sigmoid(model(x.view(b*n, c)).view(b, n, -1))
+                    per_window_pred = model(x.view(b*n, c)).view(b, n, -1)
                     pred = per_window_pred.max(dim=1)[0].cpu().numpy()
+                if cfg.rank_mean: pred = rankdata(pred, axis=1)
+                # pred = (pred-pred.min(axis=1, keepdims=True))/(pred.max(axis=1, keepdims=True)-pred.min(axis=1, keepdims=True))
+                # pred = np.array([(one[:, np.newaxis] - one).mean(axis=1) for one in pred])
                 if cfg.model_per_species:
                     sid = int(fname[1:])
-                    batch_preds[:, sid] += pred[:, 0]/(len(models)//24)
+                    batch_preds[:, sid] += pred[:, 0] * weight
                 else:
-                    batch_preds += pred/len(models)
+                    batch_preds += pred * weight
             preds.append(batch_preds)
     preds = np.concatenate(preds, axis=0)
-    return uids, preds
+    if len(trues) > 0: trues = np.concatenate(trues, axis=0)
+    if len(masks) > 0: masks = np.concatenate(masks, axis=0)
+    return uids, preds, trues, masks
 
 
 if __name__ == '__main__':
@@ -100,11 +118,19 @@ if __name__ == '__main__':
     parser.add_argument('--slide_offset', type=int)
     parser.add_argument('--model_per_species', type=int)
     parser.add_argument('--full_clip', type=int, default=1)
+    parser.add_argument('--weights', type=str)
+    parser.add_argument('--rank_mean', type=int, default=0)
     args = parser.parse_args()
 
     cfg = CFG(vars(args))
 
-    uids, preds = infer(cfg)
+    uids, preds, trues, masks = infer(cfg)
+
+    if args.fold is not None:
+        rel_index = np.argwhere(masks)
+        tmp = tuple(rel_index.T)
+        val_metric = kaggle_metric(np.expand_dims(preds[tmp], 0), np.expand_dims(trues[tmp], 0))
+        print(f'Fold{args.fold} SCORE', val_metric)
 
     # make submission csv
     label_cols = [f's{i}' for i in range(24)]
@@ -112,6 +138,4 @@ if __name__ == '__main__':
     submission.index = submission.index.rename('recording_id')
     submission.to_csv(os.path.join(args.out_dir, 'submission.csv'), index=True)
 
-    if args.fold is not None:
-        train_df = pd.read_csv(args.train_df_path, index_col='StudyInstanceUID')
-        print(f'Fold{args.fold} SCORE', kaggle_metric(submission.values, train_df.loc[submission.index, label_cols].values))
+
